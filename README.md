@@ -344,3 +344,15 @@ uv run ruff format src/ tests/ # format
 5. Add a test case in `tests/test_scenarios.py`
 
 The `ScenarioMetadata` must include a `failure_category` from the set `{none, data, resource, code, cascade}` so that `workflow-monitor` can use it as a classification label.
+
+## Limitations
+
+This project has been developed and tested on a single-host setup: **macOS arm64** running Pegasus 5.1.2 (Homebrew) and HTCondor 25.6.1 with a `minicondor` personal pool. All generated workflows use `sharedfs` data configuration and target a local `condorpool` execution site.
+
+Behavior may differ on other setups:
+
+- **Linux clusters / HPC** — Shared filesystem paths, scratch directories, and `getenv=True` assumptions may not apply. Multi-node pools with separate submit and execute hosts will need site catalog adjustments.
+- **Non-shared filesystems** — Workflows assume `sharedfs` mode. Deployments using `condorio` or `nonsharedfs` require changes to the data configuration and may alter how staging failures (e.g., `missing_input`) manifest.
+- **Pegasus Python path** — Generated scripts hardcode `/opt/homebrew/opt/pegasus/lib/pegasus/python` for the Pegasus API. Other installations (pip, RPM, tarball) will need this path updated or `PYTHONPATH` set.
+- **HTCondor policy expressions** — `periodic_hold` expressions for `memory_exceeded` and `timeout` scenarios depend on ClassAd attributes (`ResidentSetSize`, `JobCurrentStartDate`) that may behave differently under cgroup v1 vs. v2, or when slot partitioning is configured.
+- **Signal handling** — Exit codes 137 (SIGKILL) and 139 (SIGSEGV) are generated via `kill -SIG $$` in shell scripts; signal delivery semantics can vary across shells and container runtimes.
