@@ -1,13 +1,15 @@
-# workflow-generator
+# predictable-workflow-failures
 
-Generate [Pegasus WMS](https://pegasus.isi.edu/) workflows with predictable failure modes for ML training data. Part of the **pegasusai** project — the sibling [`workflow-monitor`](../workflow-monitor) consumes the generated workflows and their labeled metadata to train failure-detection models.
+Generate [Pegasus WMS](https://pegasus.isi.edu/) workflows with predictable, labeled failure modes. Each scenario produces a self-contained workflow that triggers a specific failure category — exit codes, data staging, resource limits, cascading dependencies, or transfer errors — for testing monitoring tools and training failure-detection models.
+
+Part of the **pegasusai** project. The sibling [`workflow-monitor`](https://github.com/pegasusai/workflow-monitor) consumes these workflows to validate its diagnostics across all failure categories and to verify parity between its live TUI, SSH client, and replay modes.
 
 Each scenario produces:
 
 - A self-contained Python workflow script using `Pegasus.api`
 - Shell executables that simulate specific failure behaviors
-- A `metadata.json` sidecar with ground-truth labels for supervised learning
-- An optional Jupyter notebook (`.ipynb`) for interactive testing in JupyterLab
+- A `metadata.json` sidecar with ground-truth labels
+- An optional Jupyter notebook (`.ipynb`) for interactive testing
 
 ## Prerequisites
 
@@ -61,16 +63,16 @@ uv run workflow-generator generate success -o ./generated
 # Generate all 7 scenarios at once
 uv run workflow-generator generate-all -o ./generated
 
-# Run the generated workflow script to produce Pegasus catalogs
+# Run the generated workflow script to produce Pegasus catalogs and submit
 cd generated/success/
 python3 workflow_success.py
 
-# Plan and submit to local HTCondor
+# Or plan and submit manually
 pegasus-plan --conf pegasus.properties --sites condorpool \
   --output-sites local --dir submit --submit workflow.yml
 
-# Monitor execution
-pegasus-status submit/<run-dir>
+# Monitor execution with workflow-monitor
+uv run workflow-monitor /path/to/generated/success
 ```
 
 ## CLI Reference
@@ -130,28 +132,29 @@ uv run workflow-generator convert generated/timeout/workflow_timeout.py -o custo
 
 ### `success` — Clean Baseline
 
-A diamond-shaped DAG (preprocess -> 2x findrange -> analyze) where every job succeeds using `pegasus-keg`. Provides positive training examples so the ML model learns the boundary between healthy and failing workflows.
+A diamond-shaped DAG (preprocess → 2x findrange → analyze) where every job succeeds using `pegasus-keg`. Provides positive examples so that monitoring tools and ML models can learn the boundary between healthy and failing workflows.
 
 - **Category:** none
 - **Expected state:** `JOB_SUCCESS`
 - **DAG shape:** Diamond (4 jobs)
+- **workflow-monitor diagnostics:** No diagnostics panel shown
 
 ### `bad_exit_code` — Non-Zero Exit Codes
 
-A 3-job linear pipeline (setup -> compute -> collect) where `compute` exits with a specific code. Parameterized to generate different exit codes:
+A 3-job linear pipeline (setup → compute → collect) where `compute` exits with a specific code. Parameterized to generate different exit codes:
 
-| Exit Code | Meaning |
-|-----------|---------|
-| 1 | Generic failure |
-| 2 | Misuse of shell command |
-| 126 | Command not executable (permission denied) |
-| 127 | Command not found |
-| 137 | Killed by SIGKILL (OOM killer) |
-| 139 | Segmentation fault (SIGSEGV) |
+| Exit Code | Meaning | Injection |
+|-----------|---------|-----------|
+| 1 | Generic failure | `exit 1` |
+| 2 | Misuse of shell command | `exit 2` |
+| 126 | Command not executable (permission denied) | `exit 126` |
+| 127 | Command not found | `exit 127` |
+| 137 | Killed by SIGKILL (OOM killer) | `kill -KILL $$` |
+| 139 | Segmentation fault (SIGSEGV) | `kill -SEGV $$` |
 
 - **Category:** code
 - **Expected state:** `JOB_FAILURE`
-- **Injection:** Executable runs `exit N` or `kill -SIG $$`
+- **workflow-monitor diagnostics:** Exit-code-based suggestions (e.g., "Killed by SIGKILL — likely OOM, increase request_memory")
 
 ### `missing_input` — Data Staging Failure
 
@@ -159,15 +162,18 @@ A diamond DAG where one branch references `phantom_data.txt` — a file delibera
 
 - **Category:** data
 - **Expected state:** `JOB_FAILURE`
-- **Injection:** Replica Catalog (PFN entry omitted)
+- **Injection:** Replica Catalog PFN points to non-existent path
+- **workflow-monitor diagnostics:** Transfer input failure pattern detected from HTCondor hold reason
 
 ### `memory_exceeded` — OOM / Periodic Hold
 
-A 3-job pipeline where `compute` allocates ~200MB of memory but requests only 50MB. HTCondor's `periodic_hold` expression detects the RSS overshoot and holds the job.
+A 3-job pipeline where `compute` allocates ~200MB of memory but requests only 50MB. HTCondor's `periodic_hold` expression detects the RSS overshoot and holds the job with a descriptive hold reason.
 
 - **Category:** resource
 - **Expected state:** `JOB_HELD`
 - **Injection:** Executable allocates memory; `periodic_hold` on `ResidentSetSize`
+- **HTCondor profile:** `periodic_hold_reason = "Job exceeded memory limit (RSS > 50MB)"`
+- **workflow-monitor diagnostics:** Memory limit pattern matched from hold reason; suggests increasing `request_memory`
 
 ### `timeout` — Wall Time Exceeded
 
@@ -176,22 +182,26 @@ A 3-job pipeline where `compute` sleeps for 300 seconds but has a 30-second wall
 - **Category:** resource
 - **Expected state:** `JOB_HELD`
 - **Injection:** Executable sleeps; `periodic_hold` on `(CurrentTime - JobCurrentStartDate)`
+- **HTCondor profile:** `periodic_hold_reason = "Job exceeded wall time limit (30s)"`
+- **workflow-monitor diagnostics:** Wall time limit pattern matched from hold reason; suggests increasing time limit or optimizing job
 
 ### `dependency_failure` — Cascading DAG Failure
 
-A fan-out/fan-in DAG (split -> branch_ok + branch_bad -> merge -> finalize) where `branch_bad` crashes, blocking `merge` and `finalize`. Tests the model's ability to distinguish root cause from collateral damage.
+A fan-out/fan-in DAG (split → branch_ok + branch_bad → merge → finalize) where `branch_bad` crashes, blocking `merge` and `finalize`. Tests the ability to distinguish root cause from collateral damage.
 
 - **Category:** cascade
 - **Expected state:** `JOB_FAILURE`
 - **Injection:** Executable exits 1; downstream jobs never submitted by DAGMan
+- **workflow-monitor diagnostics:** Exit-code diagnostics for `branch_bad`; `merge` and `finalize` show as `UNSUBMITTED`
 
 ### `transfer_failure` — Missing Output
 
-A 3-job pipeline where `compute` exits 0 but never creates its declared output file. Pegasus's post-script detects the missing output and fails the job despite the clean exit code. This is a subtle failure — the model must learn to look beyond exit codes.
+A 3-job pipeline where `compute` exits 0 but never creates its declared output file. Pegasus's post-script detects the missing output and fails the job despite the clean exit code. This is a subtle failure — exit codes alone are not sufficient to detect it.
 
 - **Category:** data
 - **Expected state:** `JOB_FAILURE`
 - **Injection:** Executable skips output creation
+- **workflow-monitor diagnostics:** "Output file transfer failed — expected file not created" from HTCondor hold reason
 
 ## Generated Output Structure
 
@@ -201,7 +211,7 @@ Each scenario produces the following directory layout:
 generated/<scenario_id>/
   workflow_<scenario_id>.py      # Self-contained Pegasus workflow script
   workflow_<scenario_id>.ipynb   # Jupyter notebook (if --notebook)
-  metadata.json                  # Ground-truth labels for ML training
+  metadata.json                  # Ground-truth labels
   bin/
     good_job.sh                  # Wrapper around pegasus-keg (succeeds)
     <failure_script>.sh          # Scenario-specific failure executable
@@ -216,6 +226,10 @@ generated/<scenario_id>/
   input.txt                      # Synthetic input data
   scratch/                       # Shared scratch directory
   output/                        # Final output directory
+  submit/                        # Pegasus submit directory
+    <user>/pegasus/<wf>/run000N/
+      braindump.yml              # Workflow metadata (used by workflow-monitor)
+      <dag>.stampede.db          # SQLite database (used by workflow-monitor)
 ```
 
 ## Metadata Format
@@ -254,25 +268,59 @@ Each `metadata.json` contains a `WorkflowManifest` with labeled scenario metadat
 | `expected_job_state` | string | `JOB_SUCCESS`, `JOB_FAILURE`, or `JOB_HELD` |
 | `affected_jobs` | list[string] | Job names that fail or are blocked |
 
-## Notebook Workflow
+## Using with workflow-monitor
 
-Generated `.ipynb` notebooks split the workflow script into interactive cells using `# --- Section: Name ---` comment markers in the source. Each section becomes a markdown heading cell followed by a code cell:
+The primary use case for this project is testing [`workflow-monitor`](https://github.com/pegasusai/workflow-monitor) across all failure categories. The monitor provides a real-time Rich TUI dashboard with diagnostics that should correctly identify and surface each failure mode.
 
-```
-[Markdown] Workflow description (from header comments)
-[Code]     import statements
-[Markdown] ## Properties — explanation
-[Code]     props = Properties(); ...
-[Markdown] ## Replica Catalog — explanation
-[Code]     rc = ReplicaCatalog(); ...
-...
-```
-
-Open notebooks in JupyterLab for step-by-step execution and inspection:
+### Testing on a local machine (sharedfs)
 
 ```bash
-jupyter lab generated/success/workflow_success.ipynb
+# Generate and run a scenario
+uv run workflow-generator generate memory_exceeded -o ./generated --data-config sharedfs
+cd generated/memory_exceeded && python3 workflow_memory_exceeded.py
+
+# Monitor with the live TUI
+uv run workflow-monitor /path/to/generated/memory_exceeded
 ```
+
+### Testing on a multi-node cluster (condorio)
+
+```bash
+# On the submit node: generate and run
+uv run workflow-generator generate memory_exceeded -o ./generated --data-config condorio
+cd generated/memory_exceeded && python3 workflow_memory_exceeded.py
+
+# Start the server daemon (writes JSONL with HTCondor ClassAd data)
+uv run workflow-monitor --serve /path/to/submit/run0001
+
+# From your local machine: monitor via SSH
+uv run workflow-monitor \
+  --remote user@submit-node:/path/to/submit/run0001/workflow-events.jsonl
+```
+
+### Comparing LIVE vs SSH modes
+
+Each scenario should produce equivalent output in both the live TUI (running directly on the submit node) and the SSH client (running locally, fetching JSONL via SSH). Key things to compare:
+
+| Panel | What to check |
+|-------|---------------|
+| **Workflow Status** | Same state, elapsed time, job counts, progress percentage |
+| **Diagnostics** | Same hold reasons, exit codes, and remediation suggestions |
+| **Compute Jobs** | Same states, exit codes, durations for all jobs |
+| **Auxiliary Jobs** | Same infrastructure job states |
+| **Recent Events** | Same sequence of job-state transitions |
+
+### Expected diagnostics by scenario
+
+| Scenario | Diagnostic trigger | Expected pattern |
+|----------|-------------------|------------------|
+| `success` | *(none)* | No diagnostics panel |
+| `bad_exit_code` | Failed job with non-zero exit | Exit code suggestions (OOM, segfault, etc.) |
+| `missing_input` | HTCondor hold — transfer input failure | "Input file transfer failed" |
+| `memory_exceeded` | HTCondor hold — RSS exceeded | "Job exceeded memory limit" |
+| `timeout` | HTCondor hold — wall time exceeded | "Job exceeded wall time limit" |
+| `dependency_failure` | Failed job with exit 1 | Exit code 1 suggestions; downstream jobs UNSUBMITTED |
+| `transfer_failure` | HTCondor hold — transfer output failure | "Output file transfer failed — expected file not created" |
 
 ## Configuration
 
@@ -294,7 +342,7 @@ uv run workflow-generator generate success -o ./generated
 uv run workflow-generator generate success -o ./generated --data-config sharedfs
 ```
 
-`dagman.retry = 0` is set in all modes to disable automatic retries, producing clean pass/fail signals for ML training.
+`dagman.retry = 0` is set in all modes to disable automatic retries, producing clean pass/fail signals.
 
 ### Site Catalog
 
@@ -335,6 +383,26 @@ export CONDOR_HOME=/opt/condor
 export CONDOR_CONFIG=/opt/condor/etc/condor_config
 ```
 
+## Notebook Workflow
+
+Generated `.ipynb` notebooks split the workflow script into interactive cells using `# --- Section: Name ---` comment markers in the source. Each section becomes a markdown heading cell followed by a code cell:
+
+```
+[Markdown] Workflow description (from header comments)
+[Code]     import statements
+[Markdown] ## Properties — explanation
+[Code]     props = Properties(); ...
+[Markdown] ## Replica Catalog — explanation
+[Code]     rc = ReplicaCatalog(); ...
+...
+```
+
+Open notebooks in JupyterLab for step-by-step execution and inspection:
+
+```bash
+jupyter lab generated/success/workflow_success.ipynb
+```
+
 ## Development
 
 ```bash
@@ -352,14 +420,14 @@ uv run ruff format src/ tests/ # format
 4. Register in `scenarios/__init__.py` by adding to the `SCENARIOS` dict
 5. Add a test case in `tests/test_scenarios.py`
 
-The `ScenarioMetadata` must include a `failure_category` from the set `{none, data, resource, code, cascade}` so that `workflow-monitor` can use it as a classification label.
+The `ScenarioMetadata` must include a `failure_category` from the set `{none, data, resource, code, cascade}`.
 
 ## Tested Platforms
 
 | Platform | Pegasus | HTCondor | Data Config | Pool |
 |----------|---------|----------|-------------|------|
 | macOS arm64 (Homebrew) | 5.1.2 | 25.6.1 | `sharedfs` | Single-node `minicondor` |
-| Ubuntu 24.04 x86_64 (FABRIC) | 5.1.2 | 24.12.17 | `condorio` | Multi-node (submit + worker) |
+| Ubuntu 24.04 x86_64 (FABRIC) | 5.1.2 | 24.12.17 | `condorio` | Multi-node (submit + 2 workers) |
 
 ## Limitations
 
@@ -368,3 +436,7 @@ Behavior may differ on untested setups:
 - **HTCondor policy expressions** — `periodic_hold` expressions for `memory_exceeded` and `timeout` scenarios depend on ClassAd attributes (`ResidentSetSize`, `JobCurrentStartDate`) that may behave differently under cgroup v1 vs. v2, or when slot partitioning is configured.
 - **Signal handling** — Exit codes 137 (SIGKILL) and 139 (SIGSEGV) are generated via `kill -SIG $$` in shell scripts; signal delivery semantics can vary across shells and container runtimes.
 - **Failure mode differences across data configs** — Some failure scenarios (e.g., `missing_input`, `transfer_failure`) may manifest differently under `condorio` vs. `sharedfs` because the file staging mechanism changes.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE) for details.
