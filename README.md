@@ -107,6 +107,7 @@ uv run workflow-generator generate success -o ./generated --no-notebook
 | `-o, --output-dir` | `./generated` | Root output directory |
 | `--exit-code` | `1` | Exit code for the `bad_exit_code` scenario (1, 2, 126, 127, 137, 139) |
 | `--notebook / --no-notebook` | `--notebook` | Generate a `.ipynb` alongside the `.py` script |
+| `--data-config` | `condorio` | Pegasus data configuration: `condorio`, `sharedfs`, or `nonsharedfs` |
 
 ### `workflow-generator generate-all`
 
@@ -277,22 +278,30 @@ jupyter lab generated/success/workflow_success.ipynb
 
 ### Data Configuration Mode
 
-All generated workflows use `sharedfs` (shared filesystem) mode, appropriate for single-machine or NFS-backed setups. This is set in the generated `pegasus.properties`:
+Generated workflows use `--data-config` to control how files are transferred between submit host and workers:
 
-```properties
-pegasus.data.configuration = sharedfs
-pegasus.monitord.encoding = json
-dagman.retry = 0
+| Mode | Use When | Description |
+|------|----------|-------------|
+| `condorio` (default) | Multi-node pool, no shared FS | HTCondor handles all file transfers |
+| `sharedfs` | Single machine or NFS-backed | Jobs read/write from a common directory |
+| `nonsharedfs` | Multi-node, Pegasus-managed | Pegasus handles transfers via `pegasus-transfer` |
+
+```bash
+# Multi-node pool (default — works everywhere)
+uv run workflow-generator generate success -o ./generated
+
+# Single machine with minicondor
+uv run workflow-generator generate success -o ./generated --data-config sharedfs
 ```
 
-`dagman.retry = 0` disables automatic retries so that failures produce clean, unambiguous signals for ML training.
+`dagman.retry = 0` is set in all modes to disable automatic retries, producing clean pass/fail signals for ML training.
 
 ### Site Catalog
 
 Generated workflows define two sites:
 
 - **`local`** — The submit host. Has `SHARED_SCRATCH` and `SHARED_STORAGE` directories under the scenario output directory.
-- **`condorpool`** — The execution site. Uses `vanilla` universe with `getenv=True` so jobs inherit the submitter's environment (including `PATH` to `pegasus-keg`).
+- **`condorpool`** — The execution site. Uses `vanilla` universe with `getenv=True`. In `sharedfs` mode, it declares a `SHARED_SCRATCH` directory; in `condorio`/`nonsharedfs` modes, it relies on HTCondor/Pegasus for file transfer.
 
 ### HTCondor Profiles
 
@@ -310,20 +319,20 @@ job.add_profiles(Namespace.CONDOR, key="periodic_hold",
     value="(JobStatus == 2) && ((CurrentTime - JobCurrentStartDate) > 30)")
 ```
 
-### Pegasus Python API Path
+### Platform Auto-Detection
 
-The Pegasus Python modules are not pip-installed — they live under the Homebrew prefix. Generated workflow scripts add the path at runtime:
+Generated workflow scripts auto-detect Pegasus and HTCondor installation paths at runtime using `shutil.which()` and filesystem probes. This supports:
 
-```python
-import sys
-sys.path.insert(0, "/opt/homebrew/opt/pegasus/lib/pegasus/python")
-from Pegasus.api import *
-```
-
-If your Pegasus installation is elsewhere, update this path in the generated scripts or set `PYTHONPATH`:
+- **macOS (Homebrew):** Pegasus Python lib at `/opt/homebrew/opt/pegasus/lib/pegasus/python`
+- **Linux (system packages):** Pegasus Python lib in `/usr/lib/python3*/dist-packages`
+- **Custom installations:** Override via environment variables
 
 ```bash
-export PYTHONPATH=/path/to/pegasus/lib/pegasus/python:$PYTHONPATH
+# Override any auto-detected path
+export PEGASUS_HOME=/opt/pegasus
+export PEGASUS_PYTHON_LIB=/opt/pegasus/lib/pegasus/python
+export CONDOR_HOME=/opt/condor
+export CONDOR_CONFIG=/opt/condor/etc/condor_config
 ```
 
 ## Development
@@ -345,14 +354,17 @@ uv run ruff format src/ tests/ # format
 
 The `ScenarioMetadata` must include a `failure_category` from the set `{none, data, resource, code, cascade}` so that `workflow-monitor` can use it as a classification label.
 
+## Tested Platforms
+
+| Platform | Pegasus | HTCondor | Data Config | Pool |
+|----------|---------|----------|-------------|------|
+| macOS arm64 (Homebrew) | 5.1.2 | 25.6.1 | `sharedfs` | Single-node `minicondor` |
+| Ubuntu 24.04 x86_64 (FABRIC) | 5.1.2 | 24.12.17 | `condorio` | Multi-node (submit + worker) |
+
 ## Limitations
 
-This project has been developed and tested on a single-host setup: **macOS arm64** running Pegasus 5.1.2 (Homebrew) and HTCondor 25.6.1 with a `minicondor` personal pool. All generated workflows use `sharedfs` data configuration and target a local `condorpool` execution site.
+Behavior may differ on untested setups:
 
-Behavior may differ on other setups:
-
-- **Linux clusters / HPC** — Shared filesystem paths, scratch directories, and `getenv=True` assumptions may not apply. Multi-node pools with separate submit and execute hosts will need site catalog adjustments.
-- **Non-shared filesystems** — Workflows assume `sharedfs` mode. Deployments using `condorio` or `nonsharedfs` require changes to the data configuration and may alter how staging failures (e.g., `missing_input`) manifest.
-- **Pegasus Python path** — Generated scripts hardcode `/opt/homebrew/opt/pegasus/lib/pegasus/python` for the Pegasus API. Other installations (pip, RPM, tarball) will need this path updated or `PYTHONPATH` set.
 - **HTCondor policy expressions** — `periodic_hold` expressions for `memory_exceeded` and `timeout` scenarios depend on ClassAd attributes (`ResidentSetSize`, `JobCurrentStartDate`) that may behave differently under cgroup v1 vs. v2, or when slot partitioning is configured.
 - **Signal handling** — Exit codes 137 (SIGKILL) and 139 (SIGSEGV) are generated via `kill -SIG $$` in shell scripts; signal delivery semantics can vary across shells and container runtimes.
+- **Failure mode differences across data configs** — Some failure scenarios (e.g., `missing_input`, `transfer_failure`) may manifest differently under `condorio` vs. `sharedfs` because the file staging mechanism changes.

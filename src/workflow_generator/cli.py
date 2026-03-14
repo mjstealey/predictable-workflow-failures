@@ -47,7 +47,11 @@ def list_cmd():
               help="Exit code for bad_exit_code scenario (default: 1).")
 @click.option("--notebook/--no-notebook", default=True,
               help="Also generate a Jupyter notebook (.ipynb) from the workflow script.")
-def generate(scenario_id: str, output_dir: str, exit_code: int, notebook: bool):
+@click.option("--data-config", type=click.Choice(["condorio", "sharedfs", "nonsharedfs"]),
+              default="condorio",
+              help="Pegasus data configuration mode (default: condorio).")
+def generate(scenario_id: str, output_dir: str, exit_code: int, notebook: bool,
+             data_config: str):
     """Generate a single failure scenario workflow.
 
     SCENARIO_ID is one of: success, bad_exit_code, missing_input,
@@ -72,7 +76,7 @@ def generate(scenario_id: str, output_dir: str, exit_code: int, notebook: bool):
     click.echo(f"  Executables: {len(scripts)} scripts in {bin_dir}/")
 
     # Generate workflow script
-    wf_script = instance.generate_workflow_script(out, bin_dir)
+    wf_script = instance.generate_workflow_script(out, bin_dir, data_config=data_config)
     click.echo(f"  Workflow script: {wf_script}")
 
     # Write metadata
@@ -101,7 +105,10 @@ def generate(scenario_id: str, output_dir: str, exit_code: int, notebook: bool):
               help="Output directory for generated workflow files.")
 @click.option("--notebook/--no-notebook", default=True,
               help="Also generate Jupyter notebooks.")
-def generate_all(output_dir: str, notebook: bool):
+@click.option("--data-config", type=click.Choice(["condorio", "sharedfs", "nonsharedfs"]),
+              default="condorio",
+              help="Pegasus data configuration mode (default: condorio).")
+def generate_all(output_dir: str, notebook: bool, data_config: str):
     """Generate all failure scenarios into separate subdirectories."""
     scenarios = list_scenarios()
     for scenario_id, cls in scenarios.items():
@@ -114,7 +121,7 @@ def generate_all(output_dir: str, notebook: bool):
         click.echo(f"Generating: {meta.display_name}")
 
         instance.generate_executables(bin_dir)
-        wf_script = instance.generate_workflow_script(out, bin_dir)
+        wf_script = instance.generate_workflow_script(out, bin_dir, data_config=data_config)
 
         manifest = WorkflowManifest(
             workflow_name=meta.scenario_id,

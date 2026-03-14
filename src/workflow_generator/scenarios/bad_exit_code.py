@@ -18,7 +18,10 @@ from pathlib import Path
 import stat
 import textwrap
 
-from workflow_generator.scenarios.base import FailureScenario, ScenarioMetadata
+from workflow_generator.scenarios.base import (
+    FailureScenario, ScenarioMetadata,
+    generate_config_block, generate_properties_block, generate_site_catalog_block,
+)
 
 # Default exit code; can be overridden at instantiation
 DEFAULT_EXIT_CODE = 1
@@ -102,9 +105,12 @@ class BadExitCodeScenario(FailureScenario):
 
         return scripts
 
-    def generate_workflow_script(self, output_dir: Path, bin_dir: Path) -> Path:
+    def generate_workflow_script(self, output_dir: Path, bin_dir: Path, data_config: str = "condorio") -> Path:
         script_path = output_dir / f"workflow_bad_exit_{self.exit_code}.py"
         abs_out = output_dir.resolve()
+        config = textwrap.indent(generate_config_block(str(abs_out)), " " * 12)
+        props = textwrap.indent(generate_properties_block(data_config), " " * 12)
+        site_cat = textwrap.indent(generate_site_catalog_block(data_config), " " * 12)
 
         script_path.write_text(textwrap.dedent(f"""\
             #!/usr/bin/env python3
@@ -131,37 +137,8 @@ class BadExitCodeScenario(FailureScenario):
 
             logging.basicConfig(level=logging.INFO)
 
-            # --- Section: Configuration ---
-            # Environment-specific paths. Edit these to match your local installation.
-            # All other paths are derived relative to WORK_DIR (the directory
-            # containing this script/notebook).
-            PEGASUS_PYTHON_LIB = "/opt/homebrew/opt/pegasus/lib/pegasus/python"
-            PEGASUS_HOME = "/opt/homebrew"
-            CONDOR_HOME = "/Users/stealey/condor"
-            CONDOR_CONFIG = os.path.join(CONDOR_HOME, "etc", "condor_config")
-
-            # Derived paths — no need to edit these
-            WORK_DIR = Path("{abs_out}")
-            BIN_DIR = WORK_DIR / "bin"
-            SCRATCH_DIR = WORK_DIR / "scratch"
-            OUTPUT_DIR = WORK_DIR / "output"
-            SUBMIT_DIR = WORK_DIR / "submit"
-
-            # Set up environment for Pegasus and HTCondor tools.
-            # Jupyter kernels may not inherit shell PATH or CONDOR_CONFIG.
-            sys.path.insert(0, PEGASUS_PYTHON_LIB)
-            os.environ["CONDOR_CONFIG"] = CONDOR_CONFIG
-            os.environ["PATH"] = os.path.join(CONDOR_HOME, "bin") + os.pathsep + os.path.join(PEGASUS_HOME, "bin") + os.pathsep + os.environ.get("PATH", "")
-            os.chdir(WORK_DIR)
-
-            from Pegasus.api import *
-
-            # --- Section: Properties ---
-            props = Properties()
-            props["pegasus.data.configuration"] = "sharedfs"
-            props["pegasus.monitord.encoding"] = "json"
-            props["dagman.retry"] = "0"
-            props.write(str(WORK_DIR / "pegasus.properties"))
+{config}
+{props}
 
             # --- Section: Replica Catalog ---
             input_file = File("input.txt")
@@ -184,33 +161,7 @@ class BadExitCodeScenario(FailureScenario):
             tc = TransformationCatalog()
             tc.add_transformations(setup_tx, compute_tx, collect_tx)
 
-            # --- Section: Site Catalog ---
-            scratch_path = str(SCRATCH_DIR)
-            output_path = str(OUTPUT_DIR)
-            scratch_url = f"file://{{scratch_path}}"
-            output_url = f"file://{{output_path}}"
-
-            local_site = Site("local")
-            local_site.add_directories(
-                Directory(Directory.SHARED_SCRATCH, scratch_path)
-                    .add_file_servers(FileServer(scratch_url, Operation.ALL)),
-                Directory(Directory.SHARED_STORAGE, output_path)
-                    .add_file_servers(FileServer(output_url, Operation.ALL)),
-            )
-
-            condorpool = Site("condorpool")
-            condorpool.add_directories(
-                Directory(Directory.SHARED_SCRATCH, scratch_path)
-                    .add_file_servers(FileServer(scratch_url, Operation.ALL)),
-            )
-            condorpool.add_profiles(Namespace.CONDOR, key="universe", value="vanilla")
-            condorpool.add_profiles(Namespace.CONDOR, key="getenv", value="True")
-            condorpool.add_profiles(Namespace.PEGASUS, key="style", value="condor")
-            condorpool.add_profiles(Namespace.ENV, key="PEGASUS_HOME", value=PEGASUS_HOME)
-            condorpool.add_profiles(Namespace.ENV, key="CONDOR_HOME", value=CONDOR_HOME)
-
-            sc = SiteCatalog()
-            sc.add_sites(local_site, condorpool)
+{site_cat}
 
             # --- Section: Workflow DAG ---
             # Linear pipeline: setup -> compute -> collect

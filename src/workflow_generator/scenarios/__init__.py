@@ -4,7 +4,13 @@ Each scenario generates a Pegasus workflow that fails in a specific,
 predictable way, producing labeled training data for workflow-monitor.
 """
 
-from workflow_generator.scenarios.base import FailureScenario, ScenarioMetadata as ScenarioMetadata
+from workflow_generator.scenarios.base import (
+    FailureScenario,
+    ScenarioMetadata as ScenarioMetadata,
+    generate_config_block as generate_config_block,
+    generate_properties_block as generate_properties_block,
+    generate_site_catalog_block as generate_site_catalog_block,
+)
 from workflow_generator.scenarios.success import SuccessScenario
 from workflow_generator.scenarios.bad_exit_code import BadExitCodeScenario
 from workflow_generator.scenarios.missing_input import MissingInputScenario
